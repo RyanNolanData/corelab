@@ -6,13 +6,16 @@ import re
 from io import BytesIO
 import unicodedata
 
-# Set page config
+# ===============================
+# Page setup
+# ===============================
 st.set_page_config(page_title="Client Visit Reconciliation", page_icon="📊", layout="wide")
-
 st.title("📊 Client Visit Reconciliation Tool")
 st.markdown("Automated solution for reconciling client visit data from Wellpass and Glofox systems")
 
-# Helper functions
+# ===============================
+# Helpers
+# ===============================
 def normalize_name(name):
     """Normalize names for better matching"""
     if pd.isna(name):
@@ -44,12 +47,12 @@ def find_potential_matches(name, name_list, threshold=0.7):
 def find_exact_or_high_similarity_match(name, name_list, name_counts_dict, threshold=0.85):
     """Find exact match or high similarity match (>0.85) for a name"""
     normalized_name = normalize_name(name)
-    
+
     # First check for exact match
     for other_name in name_list:
         if normalize_name(other_name) == normalized_name:
             return other_name, name_counts_dict.get(other_name, 0), 1.0
-    
+
     # Then check for high similarity matches
     for other_name in name_list:
         normalized_other = normalize_name(other_name)
@@ -57,11 +60,11 @@ def find_exact_or_high_similarity_match(name, name_list, name_counts_dict, thres
             sim = similarity(normalized_name, normalized_other)
             if sim >= threshold:
                 return other_name, name_counts_dict.get(other_name, 0), sim
-    
+
     return None, 0, 0.0
 
 def to_excel_download(df, filename):
-    """Convert dataframe to excel and create download button"""
+    """Convert dataframe to excel and return bytes"""
     output = BytesIO()
     with pd.ExcelWriter(output, engine='openpyxl') as writer:
         df.to_excel(writer, index=False, sheet_name='Sheet1')
@@ -77,9 +80,24 @@ def create_multi_sheet_excel(dataframes_dict):
     processed_data = output.getvalue()
     return processed_data
 
-# Data Upload Section
-st.header("📁 Data Upload")
+# ---- session helpers ----
+def _lower_yes(x):
+    try:
+        return str(x).strip().lower() == "yes"
+    except Exception:
+        return False
 
+if "review_df" not in st.session_state:
+    st.session_state.review_df = None
+if "approved_mapping" not in st.session_state:
+    st.session_state.approved_mapping = {}  # {Glofox_Name -> Wellpass_Name}
+if "submitted_review" not in st.session_state:
+    st.session_state.submitted_review = False
+
+# ===============================
+# Upload
+# ===============================
+st.header("📁 Data Upload")
 col1, col2 = st.columns(2)
 
 with col1:
@@ -90,62 +108,174 @@ with col2:
     st.subheader("Glofox Data Upload")
     glofox_file = st.file_uploader("Upload Glofox Excel file", type=['xlsx'], key="glofox")
 
-# Process data if both files are uploaded
+# ===============================
+# Main
+# ===============================
 if wellpass_file is not None and glofox_file is not None:
     try:
         # Load data
         wellpass_df = pd.read_excel(wellpass_file)
         glofox_df = pd.read_excel(glofox_file)
-        
+
         st.success("✅ Both files loaded successfully!")
-        
-        # Display data preview
+
+        # Preview
         st.subheader("📋 Data Preview")
-        col1, col2 = st.columns(2)
-        
-        with col1:
+        c1, c2 = st.columns(2)
+        with c1:
             st.write("**Wellpass Data Preview:**")
             st.dataframe(wellpass_df.head())
-            
-        with col2:
+        with c2:
             st.write("**Glofox Data Preview:**")
             st.dataframe(glofox_df.head())
-        
-        # Process Wellpass data (assuming columns: 'Vor- & Nachname', 'Datum', 'Zeit')
+
+        # Normalize/prepare working frames (assumes col 0=name, col 1=date per your examples)
         wellpass_processed = wellpass_df.copy()
-        wellpass_processed['Full_Name'] = wellpass_processed.iloc[:, 0]  # First column (name)
-        wellpass_processed['Date'] = pd.to_datetime(wellpass_processed.iloc[:, 1])  # Second column (date)
-        
-        # Process Glofox data (assuming columns: 'Visit Date', 'Client Name')
+        wellpass_processed['Full_Name'] = wellpass_processed.iloc[:, 0]
+        wellpass_processed['Date'] = pd.to_datetime(wellpass_processed.iloc[:, 1], errors='coerce')
+
         glofox_processed = glofox_df.copy()
-        glofox_processed['Full_Name'] = glofox_processed.iloc[:, 1]  # Second column (client name)
-        glofox_processed['Date'] = pd.to_datetime(glofox_processed.iloc[:, 0])  # First column (visit date)
-        
+        glofox_processed['Full_Name'] = glofox_processed.iloc[:, 1]
+        glofox_processed['Date'] = pd.to_datetime(glofox_processed.iloc[:, 0], errors='coerce')
+
+        # ---------------------------------------------------------
+        # STEP A — Potential Name Differences (REVIEW FIRST)
+        # ---------------------------------------------------------
         st.divider()
-        
-        # Step 1: Aggregate Totals
-        st.header("📊 Aggregate Totals")
-        
-        # Count visits per client in each system
+        st.header("🔍 Potential Name Differences (Review First)")
+
+        # Build counts for suggestion scoring
         wellpass_counts = wellpass_processed['Full_Name'].value_counts().reset_index()
         wellpass_counts.columns = ['Full_Name', 'Total_Visits']
-        wellpass_counts['System'] = 'Wellpass'
-        
         glofox_counts = glofox_processed['Full_Name'].value_counts().reset_index()
         glofox_counts.columns = ['Full_Name', 'Total_Visits']
-        glofox_counts['System'] = 'Glofox'
-        
-        # Create dictionaries for easy lookup
+
+        # Dicts & name sets
         wellpass_counts_dict = dict(zip(wellpass_counts['Full_Name'], wellpass_counts['Total_Visits']))
-        glofox_counts_dict = dict(zip(glofox_counts['Full_Name'], glofox_counts['Total_Visits']))
-        
-        # Combine and sort
-        step1_df = pd.concat([wellpass_counts, glofox_counts], ignore_index=True)
-        step1_df = step1_df.sort_values('Full_Name').reset_index(drop=True)
-        
+        glofox_counts_dict  = dict(zip(glofox_counts['Full_Name'],  glofox_counts['Total_Visits']))
+
+        all_wellpass_names = set(wellpass_counts['Full_Name'].tolist())
+        all_glofox_names   = set(glofox_counts['Full_Name'].tolist())
+
+        # Build suggestions (bi-directional, deduped)
+        potential_matches = []
+
+        # WP -> GF
+        for wp_name in all_wellpass_names:
+            wp_count = wellpass_counts_dict[wp_name]
+            matches = find_potential_matches(wp_name, all_glofox_names, threshold=0.7)
+            for match_name, similarity_score in matches:
+                gf_count = glofox_counts_dict[match_name]
+                potential_matches.append({
+                    'Wellpass System Name': wp_name,
+                    'Times in System Wellpass': wp_count,
+                    'Glofox System Name': match_name,
+                    'Times in System Glofox': gf_count,
+                    'Similarity_Score': round(similarity_score, 3)
+                })
+
+        # GF -> WP (avoid duplicates)
+        for gf_name in all_glofox_names:
+            gf_count = glofox_counts_dict[gf_name]
+            matches = find_potential_matches(gf_name, all_wellpass_names, threshold=0.7)
+            for match_name, similarity_score in matches:
+                wp_count = wellpass_counts_dict[match_name]
+                duplicate_exists = any(
+                    (existing['Wellpass System Name'] == match_name and existing['Glofox System Name'] == gf_name)
+                    for existing in potential_matches
+                )
+                if not duplicate_exists:
+                    potential_matches.append({
+                        'Wellpass System Name': match_name,
+                        'Times in System Wellpass': wp_count,
+                        'Glofox System Name': gf_name,
+                        'Times in System Glofox': gf_count,
+                        'Similarity_Score': round(similarity_score, 3)
+                    })
+
+        step3_df = pd.DataFrame(potential_matches)
+        if not step3_df.empty:
+            step3_df = step3_df.sort_values(['Similarity_Score'], ascending=False).reset_index(drop=True)
+            step3_df = step3_df.drop_duplicates(subset=['Wellpass System Name', 'Glofox System Name'])
+
+        st.subheader("Review & Confirm, then click **Submit & Apply**")
+        base_cols   = ['Wellpass System Name', 'Glofox System Name', 'Similarity_Score']
+        review_base = (step3_df[base_cols].copy() if not step3_df.empty else pd.DataFrame(columns=base_cols))
+
+        # 1) Auto-populate Yes/No by your 0.85 threshold
+        if not review_base.empty:
+            review_base['Confirm_Match'] = np.where(review_base['Similarity_Score'] >= 0.85, "Yes", "No")
+        else:
+            review_base['Confirm_Match'] = pd.Series(dtype=str)
+
+        # Keep any prior user edits
+        if st.session_state.review_df is not None and not st.session_state.review_df.empty:
+            prev = st.session_state.review_df[base_cols + ['Confirm_Match']].copy()
+            review_merged = review_base.merge(prev, on=base_cols, how='left', suffixes=('', '_prev'))
+            review_merged['Confirm_Match'] = review_merged['Confirm_Match_prev'].fillna(review_merged['Confirm_Match'])
+            review_merged = review_merged.drop(columns=['Confirm_Match_prev'])
+        else:
+            review_merged = review_base
+
+        # 2) Use a form so it doesn't rerun while editing—only on submit
+        with st.form("review_form", clear_on_submit=False):
+            edited = st.data_editor(
+                review_merged,
+                use_container_width=True,
+                num_rows="dynamic",
+                hide_index=True,
+                key="review_editor"
+            )
+            blanks = edited['Confirm_Match'].astype(str).str.strip().eq("").any() if not edited.empty else False
+            submit_clicked = st.form_submit_button(
+                "✅ Submit & Apply",
+                disabled=blanks and not edited.empty,
+                help="Applies your Yes/No and runs all calculations below"
+            )
+
+        # Persist what’s in the editor
+        st.session_state.review_df = edited
+
+        # Build mapping & unlock the rest only when submitted
+        if submit_clicked:
+            yes_rows = edited[edited['Confirm_Match'].astype(str).str.strip().str.lower().eq("yes")] if not edited.empty else pd.DataFrame(columns=edited.columns)
+            approved_mapping = dict(zip(yes_rows['Glofox System Name'], yes_rows['Wellpass System Name']))
+            st.session_state.approved_mapping = approved_mapping
+            st.session_state.submitted_review = True
+            st.success(f"Applied {len(approved_mapping)} approved matches. Calculating results below…")
+        else:
+            if not st.session_state.get("submitted_review", False):
+                st.info("⬆️ Review the table above, then click **Submit & Apply** to proceed.")
+                st.stop()
+
+        # ---------------------------------------------------------
+        # From here on: run all calculations using approved mapping
+        # ---------------------------------------------------------
+        glofox_canon = glofox_processed.copy()
+        if st.session_state.approved_mapping:
+            glofox_canon['Full_Name'] = glofox_canon['Full_Name'].replace(st.session_state.approved_mapping)
+
+        st.divider()
+
+        # ===============================
+        # Step 1: Aggregate Totals (post-approval)
+        # ===============================
+        st.header("📊 Aggregate Totals")
+
+        wp_counts = wellpass_processed['Full_Name'].value_counts().reset_index()
+        wp_counts.columns = ['Full_Name', 'Total_Visits']
+        wp_counts['System'] = 'Wellpass'
+
+        gf_counts = glofox_canon['Full_Name'].value_counts().reset_index()
+        gf_counts.columns = ['Full_Name', 'Total_Visits']
+        gf_counts['System'] = 'Glofox'
+
+        wp_counts_dict = dict(zip(wp_counts['Full_Name'], wp_counts['Total_Visits']))
+        gf_counts_dict = dict(zip(gf_counts['Full_Name'], gf_counts['Total_Visits']))
+
+        step1_df = pd.concat([wp_counts, gf_counts], ignore_index=True).sort_values('Full_Name').reset_index(drop=True)
         st.dataframe(step1_df)
-        
-        # Download button for Step 1
+
         step1_excel = to_excel_download(step1_df, "Aggregate_Totals.xlsx")
         st.download_button(
             label="📥 Download Aggregate Totals",
@@ -153,32 +283,40 @@ if wellpass_file is not None and glofox_file is not None:
             file_name="Aggregate_Totals.xlsx",
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
         )
-        
+
         st.divider()
-        
-        # Step 2: Updated Differences Section
+
+        # ===============================
+        # Step 2: Differences (+ Missing Dates)
+        # ===============================
         st.header("⚠️ Differences")
-        
-        all_wellpass_names = set(wellpass_counts['Full_Name'].tolist())
-        all_glofox_names = set(glofox_counts['Full_Name'].tolist())
-        
+
+        all_wellpass_names = set(wp_counts['Full_Name'].tolist())
+        all_glofox_names   = set(gf_counts['Full_Name'].tolist())
+
         differences_data = []
-        matched_pairs = set()  # Track matched pairs to avoid duplicates
-        
-        # Process each Wellpass name
+        matched_pairs = set()
+
+        # Try exact match first; then fallback to similarity match for remaining
         for wp_name in sorted(all_wellpass_names):
-            wp_count = wellpass_counts_dict[wp_name]
-            
-            # Find exact or high similarity match in Glofox
-            matched_name, gf_count, sim_score = find_exact_or_high_similarity_match(
-                wp_name, all_glofox_names, glofox_counts_dict, threshold=0.85
-            )
-            
-            if matched_name:
-                # Found a match with similarity >= 0.85
-                pair_key = (wp_name, matched_name)
-                if pair_key not in matched_pairs:
-                    matched_pairs.add(pair_key)
+            wp_count = wp_counts_dict[wp_name]
+            if wp_name in all_glofox_names:
+                gf_count = gf_counts_dict[wp_name]
+                matched_pairs.add((wp_name, wp_name))
+                difference = abs(gf_count - wp_count)
+                differences_data.append({
+                    'Wellpass System Name': wp_name,
+                    'Glofox System Name': wp_name,
+                    'Glofox': gf_count,
+                    'Wellpass': wp_count,
+                    'Difference': difference
+                })
+            else:
+                matched_name, gf_count, _ = find_exact_or_high_similarity_match(
+                    wp_name, all_glofox_names, gf_counts_dict, threshold=0.85
+                )
+                if matched_name:
+                    matched_pairs.add((wp_name, matched_name))
                     difference = abs(gf_count - wp_count)
                     differences_data.append({
                         'Wellpass System Name': wp_name,
@@ -187,24 +325,20 @@ if wellpass_file is not None and glofox_file is not None:
                         'Wellpass': wp_count,
                         'Difference': difference
                     })
-            else:
-                # No match found
-                differences_data.append({
-                    'Wellpass System Name': wp_name,
-                    'Glofox System Name': '',
-                    'Glofox': 0,
-                    'Wellpass': wp_count,
-                    'Difference': wp_count
-                })
-        
-        # Process remaining Glofox names that weren't matched
-        matched_glofox_names = set()
-        for pair in matched_pairs:
-            matched_glofox_names.add(pair[1])  # pair[1] is the Glofox name
-        
-        remaining_glofox_names = all_glofox_names - matched_glofox_names
-        for gf_name in sorted(remaining_glofox_names):
-            gf_count = glofox_counts_dict[gf_name]
+                else:
+                    differences_data.append({
+                        'Wellpass System Name': wp_name,
+                        'Glofox System Name': '',
+                        'Glofox': 0,
+                        'Wellpass': wp_count,
+                        'Difference': wp_count
+                    })
+
+        # Add remaining Glofox-only names
+        matched_glofox_names = {pair[1] for pair in matched_pairs}
+        remaining_gf = all_glofox_names - matched_glofox_names
+        for gf_name in sorted(remaining_gf):
+            gf_count = gf_counts_dict[gf_name]
             differences_data.append({
                 'Wellpass System Name': '',
                 'Glofox System Name': gf_name,
@@ -212,16 +346,48 @@ if wellpass_file is not None and glofox_file is not None:
                 'Wellpass': 0,
                 'Difference': gf_count
             })
-        
-        # Create DataFrame and sort by Wellpass System Name
+
         step2_df = pd.DataFrame(differences_data)
-        # Filter out rows where difference is 0
         step2_df = step2_df[step2_df['Difference'] > 0]
         step2_df = step2_df.sort_values('Wellpass System Name', na_position='last').reset_index(drop=True)
-        
+
+        # ---- Missing_Date_1..10 columns ----
+        def to_date_set(df):
+            # collapse to unique date objects
+            dates = (df[['Full_Name', 'Date']]
+                     .dropna(subset=['Full_Name', 'Date'])
+                     .copy())
+            dates['Date'] = pd.to_datetime(dates['Date'], errors='coerce').dt.date
+            return dates.groupby('Full_Name')['Date'].apply(lambda s: set(s.tolist())).to_dict()
+
+        wellpass_date_map = to_date_set(wellpass_processed)
+        glofox_date_map   = to_date_set(glofox_canon)
+
+        def compute_missing_dates(wp_name, gf_name):
+            wp_dates = wellpass_date_map.get(wp_name, set()) if isinstance(wp_name, str) and wp_name else set()
+            gf_dates = glofox_date_map.get(gf_name, set())   if isinstance(gf_name, str) and gf_name else set()
+
+            if wp_dates and gf_dates:
+                missing = sorted(wp_dates.symmetric_difference(gf_dates))
+            elif wp_dates:
+                missing = sorted(wp_dates)
+            elif gf_dates:
+                missing = sorted(gf_dates)
+            else:
+                missing = []
+            return [d.isoformat() for d in missing[:10]]
+
+        missing_cols = [f"Missing_Date_{i}" for i in range(1, 11)]
+        for col in missing_cols:
+            step2_df[col] = ""
+
+        for idx, row in step2_df.iterrows():
+            dates_list = compute_missing_dates(row.get('Wellpass System Name', ''), row.get('Glofox System Name', ''))
+            for i, d in enumerate(dates_list):
+                step2_df.at[idx, missing_cols[i]] = d
+
         st.dataframe(step2_df)
-        
-        # Download button for Step 2
+
         if not step2_df.empty:
             step2_excel = to_excel_download(step2_df, "Differences.xlsx")
             st.download_button(
@@ -232,125 +398,59 @@ if wellpass_file is not None and glofox_file is not None:
             )
         else:
             st.info("No differences found in visit counts!")
-        
+
         st.divider()
-        
-        # Step 3: Updated Potential Name Differences Section
-        st.header("🔍 Potential Name Differences")
-        
-        potential_matches = []
-        
-        # Check Wellpass names against Glofox names for potential matches (0.7 and above similarity)
-        for wp_name in all_wellpass_names:
-            wp_count = wellpass_counts_dict[wp_name]
-            
-            # Find matches with similarity 0.7 and above
-            matches = find_potential_matches(wp_name, all_glofox_names, threshold=0.7)
-            for match_name, similarity_score in matches:
-                gf_count = glofox_counts_dict[match_name]
-                potential_matches.append({
-                    'Wellpass System Name': wp_name,
-                    'Times in System Wellpass': wp_count,
-                    'Glofox System Name': match_name,
-                    'Times in System Glofox': gf_count,
-                    'Similarity_Score': round(similarity_score, 3),
-                    'Issue_Type': 'Potential Misspelling/Format Difference'
-                })
-        
-        # Check Glofox names against Wellpass names for potential matches (0.7 and above similarity)
-        for gf_name in all_glofox_names:
-            gf_count = glofox_counts_dict[gf_name]
-            
-            # Find matches with similarity 0.7 and above
-            matches = find_potential_matches(gf_name, all_wellpass_names, threshold=0.7)
-            for match_name, similarity_score in matches:
-                wp_count = wellpass_counts_dict[match_name]
-                
-                # Check if this combination already exists (to avoid duplicates)
-                duplicate_exists = False
-                for existing in potential_matches:
-                    if (existing['Wellpass System Name'] == match_name and 
-                        existing['Glofox System Name'] == gf_name):
-                        duplicate_exists = True
-                        break
-                
-                if not duplicate_exists:
-                    potential_matches.append({
-                        'Wellpass System Name': match_name,
-                        'Times in System Wellpass': wp_count,
-                        'Glofox System Name': gf_name,
-                        'Times in System Glofox': gf_count,
-                        'Similarity_Score': round(similarity_score, 3),
-                        'Issue_Type': 'Potential Misspelling/Format Difference'
-                    })
-        
-        step3_df = pd.DataFrame(potential_matches)
-        if not step3_df.empty:
-            step3_df = step3_df.sort_values(['Similarity_Score'], ascending=False).reset_index(drop=True)
-            step3_df = step3_df.drop_duplicates(subset=['Wellpass System Name', 'Glofox System Name'])
-        
-        st.dataframe(step3_df)
-        
-        # Download button for Step 3
-        if not step3_df.empty:
-            step3_excel = to_excel_download(step3_df, "Potential_Name_Differences.xlsx")
+
+        # ===============================
+        # Step 3: Reviewed Potential Name Differences (for reference/download)
+        # ===============================
+        st.header("📝 Reviewed Potential Name Differences (Your decisions)")
+        st.dataframe(st.session_state.review_df if st.session_state.review_df is not None else pd.DataFrame())
+        if st.session_state.review_df is not None and not st.session_state.review_df.empty:
+            reviewed_excel = to_excel_download(st.session_state.review_df, "Reviewed_Potential_Matches.xlsx")
             st.download_button(
-                label="📥 Download Potential Name Differences",
-                data=step3_excel,
-                file_name="Potential_Name_Differences.xlsx",
+                "📥 Download Reviewed Potential Matches",
+                data=reviewed_excel,
+                file_name="Reviewed_Potential_Matches.xlsx",
                 mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
             )
-        else:
-            st.info("No potential name differences found!")
-        
+
         st.divider()
-        
-        # Step 4: Clients in One List but Not the Other
+
+        # ===============================
+        # Step 4: Clients in One List Only
+        # ===============================
         st.header("👥 Clients in One List Only")
-        
+
         missing_clients = []
-        
-        # Find names that don't have exact or high similarity matches
         wellpass_unmatched = set()
         glofox_unmatched = set()
-        
+
         for wp_name in all_wellpass_names:
             matched_name, _, _ = find_exact_or_high_similarity_match(
-                wp_name, all_glofox_names, glofox_counts_dict, threshold=0.85
+                wp_name, all_glofox_names, gf_counts_dict, threshold=0.85
             )
-            if not matched_name:
+            if not matched_name and wp_name not in all_glofox_names:
                 wellpass_unmatched.add(wp_name)
-        
+
         for gf_name in all_glofox_names:
             matched_name, _, _ = find_exact_or_high_similarity_match(
-                gf_name, all_wellpass_names, wellpass_counts_dict, threshold=0.85
+                gf_name, all_wellpass_names, wp_counts_dict, threshold=0.85
             )
-            if not matched_name:
+            if not matched_name and gf_name not in all_wellpass_names:
                 glofox_unmatched.add(gf_name)
-        
-        # Clients in Wellpass but not matched in Glofox
+
         for name in wellpass_unmatched:
-            missing_clients.append({
-                'Name': name,
-                'List_Appeared': 'Wellpass',
-                'List_Missing': 'Glofox'
-            })
-        
-        # Clients in Glofox but not matched in Wellpass
+            missing_clients.append({'Name': name, 'List_Appeared': 'Wellpass', 'List_Missing': 'Glofox'})
         for name in glofox_unmatched:
-            missing_clients.append({
-                'Name': name,
-                'List_Appeared': 'Glofox',
-                'List_Missing': 'Wellpass'
-            })
-        
+            missing_clients.append({'Name': name, 'List_Appeared': 'Glofox', 'List_Missing': 'Wellpass'})
+
         step4_df = pd.DataFrame(missing_clients)
         if not step4_df.empty:
             step4_df = step4_df.sort_values(['List_Appeared', 'Name']).reset_index(drop=True)
-        
+
         st.dataframe(step4_df)
-        
-        # Download button for Step 4
+
         if not step4_df.empty:
             step4_excel = to_excel_download(step4_df, "Clients_One_List_Only.xlsx")
             st.download_button(
@@ -361,44 +461,39 @@ if wellpass_file is not None and glofox_file is not None:
             )
         else:
             st.info("All clients appear in both lists!")
-        
-        # Summary section
+
+        # ===============================
+        # Summary + Complete Report
+        # ===============================
         st.divider()
         st.header("📈 Summary")
-        
-        col1, col2, col3, col4 = st.columns(4)
-        
-        with col1:
+
+        colA, colB, colC, colD = st.columns(4)
+        with colA:
             st.metric("Total Wellpass Clients", len(all_wellpass_names))
-        
-        with col2:
+        with colB:
             st.metric("Total Glofox Clients", len(all_glofox_names))
-        
-        with col3:
+        with colC:
             st.metric("Clients with Differences", len(step2_df))
-        
-        with col4:
-            st.metric("Potential Name Issues", len(step3_df))
-        
-        # Download All Data Button
+        with colD:
+            st.metric("Potential Name Issues (suggestions shown)", len(step3_df))
+
         st.divider()
         st.header("Complete Report")
-        
-        # Prepare all dataframes for multi-sheet Excel
+
         all_data_sheets = {
             "1_Aggregate_Totals": step1_df,
             "2_Differences": step2_df if not step2_df.empty else pd.DataFrame([{"Note": "No differences found"}]),
-            "3_Potential_Name_Differences": step3_df if not step3_df.empty else pd.DataFrame([{"Note": "No potential name differences found"}]),
+            "3_Potential_Name_Differences_Reviewed": st.session_state.review_df if st.session_state.review_df is not None else pd.DataFrame([{"Note": "No review performed"}]),
             "4_Clients_One_List_Only": step4_df if not step4_df.empty else pd.DataFrame([{"Note": "All clients appear in both lists"}])
         }
-        
-        # Create summary sheet
+
         summary_data = {
             "Metric": [
                 "Total Wellpass Clients",
-                "Total Glofox Clients", 
+                "Total Glofox Clients",
                 "Clients with Visit Count Differences",
-                "Potential Name Issues",
+                "Potential Name Issues (suggestions shown)",
                 "Clients Only in Wellpass",
                 "Clients Only in Glofox"
             ],
@@ -407,16 +502,14 @@ if wellpass_file is not None and glofox_file is not None:
                 len(all_glofox_names),
                 len(step2_df),
                 len(step3_df),
-                len(wellpass_unmatched),
-                len(glofox_unmatched)
+                len({n for n in all_wellpass_names if n not in all_glofox_names}),
+                len({n for n in all_glofox_names if n not in all_wellpass_names})
             ]
         }
         summary_df = pd.DataFrame(summary_data)
         all_data_sheets["0_Summary"] = summary_df
-        
-        # Create the multi-sheet Excel file
+
         all_data_excel = create_multi_sheet_excel(all_data_sheets)
-        
         st.download_button(
             label="Download Complete Reconciliation Report",
             data=all_data_excel,
@@ -424,12 +517,11 @@ if wellpass_file is not None and glofox_file is not None:
             mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             help="Downloads all reconciliation data in a single Excel file with separate sheets for each step"
         )
-        
-        st.success("✅ Complete reconciliation analysis finished! Use the button above to download all results in one comprehensive Excel file.")
-            
+
+        st.success("✅ Reconciliation complete based on your approved matches.")
+
     except Exception as e:
         st.error(f"Error processing files: {str(e)}")
         st.info("Please ensure your Excel files have the correct format and column names.")
-
 else:
     st.info("👆 Please upload both Wellpass and Glofox Excel files to begin the reconciliation process.")
