@@ -5,6 +5,7 @@ from difflib import SequenceMatcher
 import re
 from io import BytesIO
 import unicodedata
+from collections import Counter
 
 # ===============================
 # Page setup
@@ -93,6 +94,10 @@ if "approved_mapping" not in st.session_state:
     st.session_state.approved_mapping = {}  # {Glofox_Name -> Wellpass_Name}
 if "submitted_review" not in st.session_state:
     st.session_state.submitted_review = False
+if "uploaded_mapping_df" not in st.session_state:
+    st.session_state.uploaded_mapping_df = None
+if "uploaded_mapping_dict" not in st.session_state:
+    st.session_state.uploaded_mapping_dict = {}  # {Glofox_Name -> Wellpass_Name}
 
 # ===============================
 # Upload
@@ -108,10 +113,17 @@ with col2:
     st.subheader("Glofox Data Upload")
     glofox_file = st.file_uploader("Upload Glofox Excel file", type=['xlsx'], key="glofox")
 
+st.subheader("Optional: Existing Approved Name Mapping (CSV)")
+mapping_file = st.file_uploader(
+    "Upload mapping CSV with columns: Wellpass System Name, Glofox System Name",
+    type=['csv'],
+    key="mapping_csv"
+)
+
 # ===============================
 # Main
 # ===============================
-if wellpass_file is not None and glofox_file is not None:
+if wellpass_file is not None and glofox_file is not None and mapping_file is not None:
     try:
         # Load data
         wellpass_df = pd.read_excel(wellpass_file)
@@ -137,6 +149,37 @@ if wellpass_file is not None and glofox_file is not None:
         glofox_processed = glofox_df.copy()
         glofox_processed['Full_Name'] = glofox_processed.iloc[:, 1]
         glofox_processed['Date'] = pd.to_datetime(glofox_processed.iloc[:, 0], errors='coerce')
+
+        # ---------------------------------------------------------
+        # Optional third CSV: pre-approved mapping (Glofox -> Wellpass)
+        # ---------------------------------------------------------
+        uploaded_mapping_df = None
+        uploaded_mapping_dict = {}
+        if mapping_file is not None:
+            try:
+                raw_map = pd.read_csv(mapping_file)
+                required_cols = {'Wellpass System Name', 'Glofox System Name'}
+                if not required_cols.issubset(set(raw_map.columns)):
+                    st.error("❌ Mapping CSV must contain columns: 'Wellpass System Name' and 'Glofox System Name'.")
+                else:
+                    tmp = raw_map[['Wellpass System Name', 'Glofox System Name']].copy()
+                    tmp['Wellpass System Name'] = tmp['Wellpass System Name'].astype(str).str.strip()
+                    tmp['Glofox System Name'] = tmp['Glofox System Name'].astype(str).str.strip()
+                    tmp = tmp.replace({'': np.nan}).dropna()
+                    tmp = tmp.drop_duplicates()
+                    uploaded_mapping_df = tmp.reset_index(drop=True)
+                    uploaded_mapping_dict = dict(zip(tmp['Glofox System Name'], tmp['Wellpass System Name']))
+                    st.session_state.uploaded_mapping_df = uploaded_mapping_df
+                    st.session_state.uploaded_mapping_dict = uploaded_mapping_dict
+                    st.success(f"📄 Loaded mapping CSV with {len(uploaded_mapping_df)} pairs.")
+            except Exception as e:
+                st.error(f"Error reading mapping CSV: {e}")
+
+        # Use session-stored mapping if present
+        if st.session_state.uploaded_mapping_df is not None:
+            uploaded_mapping_df = st.session_state.uploaded_mapping_df
+        if st.session_state.uploaded_mapping_dict:
+            uploaded_mapping_dict = st.session_state.uploaded_mapping_dict
 
         # ---------------------------------------------------------
         # STEP A — Potential Name Differences (REVIEW FIRST)
@@ -202,13 +245,21 @@ if wellpass_file is not None and glofox_file is not None:
         base_cols   = ['Wellpass System Name', 'Glofox System Name', 'Similarity_Score']
         review_base = (step3_df[base_cols].copy() if not step3_df.empty else pd.DataFrame(columns=base_cols))
 
-        # 1) Auto-populate Yes/No by your 0.85 threshold
+        # Auto-populate Yes/No by your 0.85 threshold
         if not review_base.empty:
             review_base['Confirm_Match'] = np.where(review_base['Similarity_Score'] >= 0.85, "Yes", "No")
         else:
             review_base['Confirm_Match'] = pd.Series(dtype=str)
 
-        # Keep any prior user edits
+        # Force uploaded mapping pairs to "Yes" when present in table
+        if uploaded_mapping_dict and not review_base.empty:
+            mask = review_base.apply(
+                lambda r: uploaded_mapping_dict.get(str(r['Glofox System Name']).strip(), None) == str(r['Wellpass System Name']).strip(),
+                axis=1
+            )
+            review_base.loc[mask, 'Confirm_Match'] = "Yes"
+
+        # Keep any prior user edits from session
         if st.session_state.review_df is not None and not st.session_state.review_df.empty:
             prev = st.session_state.review_df[base_cols + ['Confirm_Match']].copy()
             review_merged = review_base.merge(prev, on=base_cols, how='left', suffixes=('', '_prev'))
@@ -217,7 +268,7 @@ if wellpass_file is not None and glofox_file is not None:
         else:
             review_merged = review_base
 
-        # 2) Use a form so it doesn't rerun while editing—only on submit
+        # FORM: no reruns while editing — only on submit
         with st.form("review_form", clear_on_submit=False):
             edited = st.data_editor(
                 review_merged,
@@ -236,13 +287,15 @@ if wellpass_file is not None and glofox_file is not None:
         # Persist what’s in the editor
         st.session_state.review_df = edited
 
-        # Build mapping & unlock the rest only when submitted
+        # Build mapping (uploaded + new YES rows). Review overrides uploaded if conflict.
         if submit_clicked:
             yes_rows = edited[edited['Confirm_Match'].astype(str).str.strip().str.lower().eq("yes")] if not edited.empty else pd.DataFrame(columns=edited.columns)
-            approved_mapping = dict(zip(yes_rows['Glofox System Name'], yes_rows['Wellpass System Name']))
-            st.session_state.approved_mapping = approved_mapping
+            review_mapping = dict(zip(yes_rows['Glofox System Name'], yes_rows['Wellpass System Name']))
+            combined_mapping = dict(uploaded_mapping_dict) if uploaded_mapping_dict else {}
+            combined_mapping.update({str(k).strip(): str(v).strip() for k, v in review_mapping.items()})
+            st.session_state.approved_mapping = combined_mapping
             st.session_state.submitted_review = True
-            st.success(f"Applied {len(approved_mapping)} approved matches. Calculating results below…")
+            st.success(f"Applied {len(combined_mapping)} total approved matches (including uploaded mapping). Calculating results below…")
         else:
             if not st.session_state.get("submitted_review", False):
                 st.info("⬆️ Review the table above, then click **Submit & Apply** to proceed.")
@@ -287,7 +340,7 @@ if wellpass_file is not None and glofox_file is not None:
         st.divider()
 
         # ===============================
-        # Step 2: Differences (+ Missing Dates)
+        # Step 2: Differences (+ Missing Dates using multiset)
         # ===============================
         st.header("⚠️ Differences")
 
@@ -351,38 +404,40 @@ if wellpass_file is not None and glofox_file is not None:
         step2_df = step2_df[step2_df['Difference'] > 0]
         step2_df = step2_df.sort_values('Wellpass System Name', na_position='last').reset_index(drop=True)
 
-        # ---- Missing_Date_1..10 columns ----
-        def to_date_set(df):
-            # collapse to unique date objects
-            dates = (df[['Full_Name', 'Date']]
-                     .dropna(subset=['Full_Name', 'Date'])
-                     .copy())
-            dates['Date'] = pd.to_datetime(dates['Date'], errors='coerce').dt.date
-            return dates.groupby('Full_Name')['Date'].apply(lambda s: set(s.tolist())).to_dict()
+        # ---- Missing_Date_1..10 using multiset (Counter) to capture duplicate same-day check-ins ----
+        def to_date_counter(df):
+            """Return dict: name -> Counter({date: count_of_checkins_that_day})"""
+            tmp = df[['Full_Name', 'Date']].dropna(subset=['Full_Name', 'Date']).copy()
+            tmp['Date'] = pd.to_datetime(tmp['Date'], errors='coerce').dt.date
+            grouped = tmp.groupby(['Full_Name', 'Date']).size().reset_index(name='cnt')
+            out = {}
+            for name, sub in grouped.groupby('Full_Name'):
+                out[name] = Counter(dict(zip(sub['Date'], sub['cnt'])))
+            return out
 
-        wellpass_date_map = to_date_set(wellpass_processed)
-        glofox_date_map   = to_date_set(glofox_canon)
+        wellpass_date_map = to_date_counter(wellpass_processed)
+        glofox_date_map   = to_date_counter(glofox_canon)
 
-        def compute_missing_dates(wp_name, gf_name):
-            wp_dates = wellpass_date_map.get(wp_name, set()) if isinstance(wp_name, str) and wp_name else set()
-            gf_dates = glofox_date_map.get(gf_name, set())   if isinstance(gf_name, str) and gf_name else set()
+        def compute_missing_dates_multiset(wp_name, gf_name):
+            """Return up to 10 ISO dates, repeating dates when one side has extra same-day check-ins."""
+            wp_ctr = wellpass_date_map.get(wp_name, Counter()) if isinstance(wp_name, str) and wp_name else Counter()
+            gf_ctr = glofox_date_map.get(gf_name, Counter())   if isinstance(gf_name, str) and gf_name else Counter()
 
-            if wp_dates and gf_dates:
-                missing = sorted(wp_dates.symmetric_difference(gf_dates))
-            elif wp_dates:
-                missing = sorted(wp_dates)
-            elif gf_dates:
-                missing = sorted(gf_dates)
-            else:
-                missing = []
-            return [d.isoformat() for d in missing[:10]]
+            missing = []
+            all_dates = sorted(set(wp_ctr.keys()) | set(gf_ctr.keys()))
+            for d in all_dates:
+                diff = wp_ctr.get(d, 0) - gf_ctr.get(d, 0)
+                if diff != 0:
+                    missing.extend([d.isoformat()] * abs(diff))
+
+            return missing[:10]
 
         missing_cols = [f"Missing_Date_{i}" for i in range(1, 11)]
         for col in missing_cols:
             step2_df[col] = ""
 
         for idx, row in step2_df.iterrows():
-            dates_list = compute_missing_dates(row.get('Wellpass System Name', ''), row.get('Glofox System Name', ''))
+            dates_list = compute_missing_dates_multiset(row.get('Wellpass System Name', ''), row.get('Glofox System Name', ''))
             for i, d in enumerate(dates_list):
                 step2_df.at[idx, missing_cols[i]] = d
 
@@ -520,8 +575,47 @@ if wellpass_file is not None and glofox_file is not None:
 
         st.success("✅ Reconciliation complete based on your approved matches.")
 
+        # ===============================
+        # Updated Mapping CSV (Append new matches and offer download)
+        # ===============================
+        st.divider()
+        st.header("🔗 Updated Approved Name Mapping (CSV)")
+
+        combined_mapping = st.session_state.approved_mapping if st.session_state.approved_mapping else {}
+
+        # Build a dataframe from combined mapping
+        updated_map_df = pd.DataFrame(
+            [(v, k) for k, v in combined_mapping.items()],
+            columns=['Wellpass System Name', 'Glofox System Name']
+        ).dropna().drop_duplicates().reset_index(drop=True)
+
+        # If an original mapping CSV was uploaded, show how many new pairs were added
+        if uploaded_mapping_df is not None and not uploaded_mapping_df.empty:
+            merged = updated_map_df.merge(
+                uploaded_mapping_df,
+                on=['Wellpass System Name', 'Glofox System Name'],
+                how='left',
+                indicator=True
+            )
+            new_rows = merged[merged['_merge'] == 'left_only'].drop(columns=['_merge'])
+            st.write(f"🆕 New pairs added since your uploaded mapping: **{len(new_rows)}**")
+        else:
+            new_rows = updated_map_df.copy()  # everything is new if no prior file
+
+        st.dataframe(updated_map_df)
+
+        # Download updated mapping CSV
+        updated_csv = updated_map_df.to_csv(index=False).encode('utf-8')
+        st.download_button(
+            "📥 Download Updated Mapping CSV",
+            data=updated_csv,
+            file_name="Approved_Name_Mapping_Updated.csv",
+            mime="text/csv",
+            help="Contains your uploaded pairs plus any newly approved matches"
+        )
+
     except Exception as e:
         st.error(f"Error processing files: {str(e)}")
-        st.info("Please ensure your Excel files have the correct format and column names.")
+        st.info("Please ensure your files have the correct format and column names.")
 else:
-    st.info("👆 Please upload both Wellpass and Glofox Excel files to begin the reconciliation process.")
+    st.info("👆 Please upload both Wellpass, Glofox and Name Mapping files to begin the reconciliation process.")
